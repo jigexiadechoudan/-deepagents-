@@ -1,0 +1,5 @@
+deepagents==0.7.30
+langchain-deepseek
+python-dotenv~=1.2.4
+pydantic>=2,<3
+langchain~=1.4.7
