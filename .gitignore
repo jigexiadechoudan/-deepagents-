@@ -1,0 +1,36 @@
+.venv/
+venv/
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+
+# Local customer material, prompts and full model conversations
+/测试场景/
+/基础资料/
+/outputs/
+/private/
+AGENTS.md
+*.log
+
+# Credentials and private keys
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+credentials*.json
+.aws/
+.ssh/
+
+# Local test and tooling artifacts
+.refactor_test_*/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
