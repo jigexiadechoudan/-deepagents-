@@ -13,6 +13,13 @@ __pycache__/
 /基础资料/
 /outputs/
 /private/
+/baselines/
+/audit/*.md
+/audit/baseline_check.py
+/audit/parity_check.py
+/audit/analyze_auto_runs.py
+/audit/analyze_runs45.py
+/项目优化过程记录.md
 AGENTS.md
 *.log
 

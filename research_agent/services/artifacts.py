@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import Counter
 from datetime import datetime
@@ -7,6 +8,7 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from langchain.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.messages import BaseMessage
 
 if TYPE_CHECKING:
@@ -50,6 +52,7 @@ def save_failure_diagnostic(
             "finished_at": execution.finished_at.isoformat(),
             "agent_elapsed_seconds": round(execution.elapsed_seconds, 3),
             "invalid_tool_call_retry_count": execution.retry_count,
+        "recursion_exhausted": execution.recursion_exhausted,
             "retry_debug_file": execution.retry_debug_file,
             "messages": [
                 message.model_dump(mode="json")
@@ -60,6 +63,50 @@ def save_failure_diagnostic(
     return path
 
 
+def _skill_version_sha(skill_dir: Path) -> str | None:
+    """技能目录内容快照：按相对路径排序逐文件哈希，目录不存在时返回 None。"""
+    if not skill_dir.is_dir():
+        return None
+    hasher = hashlib.sha256()
+    for path in sorted(p for p in skill_dir.rglob("*") if p.is_file()):
+        hasher.update(path.relative_to(skill_dir).as_posix().encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(path.read_bytes())
+    return hasher.hexdigest()
+
+
+def _transcript(messages: list[BaseMessage]) -> list[dict[str, Any]]:
+    """每次模型调用的动作与 token 用量，用于事后定位输出截断与重复提交。
+
+    ToolMessage 的两类错误反馈也记录在案：schema 校验失败（langchain
+    ToolStrategy handle_errors=True 的固定模板，以 "Error: " 开头且不带
+    error 状态）与工具/修复注入的 error 状态消息，此前均为黑盒。
+    """
+    rows: list[dict[str, Any]] = []
+    for message in messages:
+        row: dict[str, Any] = {"type": message.type}
+        usage = (getattr(message, "response_metadata", None) or {}).get("token_usage") or {}
+        if usage.get("completion_tokens"):
+            row["prompt_tokens"] = usage.get("prompt_tokens")
+            row["completion_tokens"] = usage.get("completion_tokens")
+        if isinstance(message, AIMessage):
+            if message.tool_calls:
+                row["tool_calls"] = [call["name"] for call in message.tool_calls]
+            if message.invalid_tool_calls:
+                row["invalid"] = [call["name"] for call in message.invalid_tool_calls]
+        if isinstance(message, ToolMessage):
+            content = message.content if isinstance(message.content, str) else ""
+            if content.startswith("Error: ") and message.status != "error":
+                row["schema_feedback"] = content[:600]
+            elif message.status == "error":
+                row["tool_error"] = content[:300]
+        if isinstance(message, HumanMessage) and isinstance(message.content, str) \
+                and message.content.startswith("内容校验未通过："):
+            row["check_feedback"] = message.content[:500]
+        rows.append(row)
+    return rows
+
+
 def save_success(
     settings: Settings,
     timestamp: str,
@@ -67,9 +114,16 @@ def save_success(
     extraction: ExtractionResult,
     material: str,
     reference: str,
+    checks: list[dict[str, Any]] | None = None,
+    baseline: dict[str, Any] | None = None,
+    baseline_manifest: dict[str, Any] | None = None,
+    baseline_stage: dict[str, Any] | None = None,
 ) -> tuple[Path, Path, dict[str, Any]]:
     output_path = settings.output_dir / f"extraction_{timestamp}.json"
-    output_path.write_text(extraction.model_dump_json(indent=2), encoding="utf-8")
+    output_path.write_text(
+        extraction.model_dump_json(indent=2, by_alias=True), encoding="utf-8"
+    )
+    transcript = _transcript(execution.result.get("messages", []))
     run_record = {
         "run_id": timestamp,
         "status": "completed",
@@ -77,10 +131,30 @@ def save_success(
         "finished_at": execution.finished_at.isoformat(),
         "agent_elapsed_seconds": round(execution.elapsed_seconds, 3),
         "invalid_tool_call_retry_count": execution.retry_count,
+        "schema_validation_retry_count": sum(
+            1 for row in transcript if "schema_feedback" in row
+        ),
+        "recursion_exhausted": execution.recursion_exhausted,
         "retry_debug_file": execution.retry_debug_file,
         "model_params": settings.model_params,
         "recursion_limit": settings.recursion_limit,
         "deepagents_version": version("deepagents"),
+        "skill_version_sha256": _skill_version_sha(settings.skill_dir),
+        "total_completion_tokens": sum(row.get("completion_tokens", 0) for row in transcript),
+        "transcript": transcript,
+        "checks": {
+            "error_count": sum(1 for v in (checks or []) if v["severity"] == "error"),
+            "items": checks or [],
+        },
+        "baseline_check": baseline,
+        "baseline_manifest": baseline_manifest,
+        "baseline_manifest_sha256": (
+            hashlib.sha256(
+                json.dumps(baseline_manifest, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            if baseline_manifest else None
+        ),
+        "baseline_stage": baseline_stage,
         "material_chars": len(material),
         "reference_chars": len(reference),
         "object_count": len(extraction.objects),
