@@ -17,6 +17,8 @@ from research_agent.services.checks import run_checks
 @dataclass
 class RepairExecution:
     extraction: ExtractionResult
+    checks: list[dict]
+    baseline: dict | None
     records: list[dict] = field(default_factory=list)
     elapsed_seconds: float = 0.0
 
@@ -25,10 +27,14 @@ def _payload(extraction):
     return extraction.model_dump(by_alias=True, exclude_none=True)
 
 
-def _issues(extraction, material, manifest):
+def _check_candidate(extraction, material, manifest):
     payload = _payload(extraction)
     checks = run_checks(payload, material)
     baseline = run_baseline_engine(payload, manifest, material) if manifest is not None else None
+    return checks, baseline
+
+
+def _issues(checks, baseline):
     return {
         "errors": [v for v in checks if v["severity"] == "error"],
         "warnings": [v for v in checks if v["severity"] == "warning"],
@@ -115,13 +121,14 @@ def merge_repair(candidate: ExtractionResult, repair: ExtractionRepair, material
 
 def repair_extraction(candidate, settings: Settings, material: str, reference: str,
                       skill_references: dict[str, str], manifest: dict | None) -> RepairExecution:
-    """语法合格后执行有限局部修复；失败保留上一份候选和诊断。"""
-    execution = RepairExecution(extraction=candidate)
+    """返回最终候选及对应完整检查；仅检查初始候选和每份合并后的候选。"""
     started = perf_counter()
+    checks, baseline = _check_candidate(candidate, material, manifest)
+    execution = RepairExecution(extraction=candidate, checks=checks, baseline=baseline)
+    issues = _issues(checks, baseline)
     feedback = None
     model = None
     for round_number in range(1, settings.max_check_rounds + 1):
-        issues = _issues(execution.extraction, material, manifest)
         if not _failures(issues):
             break
         record = {"round": round_number, "issues_before": issues, "accepted": False}
@@ -146,7 +153,8 @@ def repair_extraction(candidate, settings: Settings, material: str, reference: s
             repair = response["parsed"]
             record["patch"] = repair.model_dump(mode="json", by_alias=True)
             merged = merge_repair(execution.extraction, repair, material)
-            after = _issues(merged, material, manifest)
+            merged_checks, merged_baseline = _check_candidate(merged, material, manifest)
+            after = _issues(merged_checks, merged_baseline)
             record["issues_after"] = after
             new_failures = _failures(after) - _failures(issues)
             old_warnings = {(v["check"], v.get("object_id"), v["message"]) for v in issues["warnings"]}
@@ -164,6 +172,9 @@ def repair_extraction(candidate, settings: Settings, material: str, reference: s
                     f"{sorted(map(str, new_failures | new_warnings | new_coverage_gaps))}"
                 )
             execution.extraction = merged
+            execution.checks = merged_checks
+            execution.baseline = merged_baseline
+            issues = after
             record["accepted"] = True
             feedback = None
         except Exception as error:

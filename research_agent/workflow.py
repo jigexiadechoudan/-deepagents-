@@ -2,13 +2,11 @@ import json
 from datetime import datetime
 from time import perf_counter
 
-from audit.baseline_engine import run_baseline_engine
 from research_agent.agent.factory import create_extraction_agent
 from research_agent.agent.prompts import build_messages
 from research_agent.config import load_settings
 from research_agent.services.artifacts import save_failure_diagnostic, save_success
 from research_agent.services.baseline_store import load_baseline
-from research_agent.services.checks import run_checks
 from research_agent.services.contract import inspect_reference_contract
 from research_agent.services.execution import execute_agent
 from research_agent.services.materials import load_material, load_reference, load_skill_files, load_skill_references
@@ -57,16 +55,14 @@ def run_extraction() -> None:
     repair_sources = {path: data["content"] for path, data in skill_files.items()}
     repair = repair_extraction(extraction, settings, material, reference, repair_sources, baseline_manifest)
     extraction = repair.extraction
-    validation_started = perf_counter()
-    violations = run_checks(extraction.model_dump(by_alias=True, exclude_none=True), material)
+    violations = repair.checks
     errors = sum(1 for v in violations if v["severity"] == "error")
     print(f"通用校验：{errors} 个错误 / {len(violations) - errors} 个警告", flush=True)
     for v in violations:
         print(f"  [{v['severity']}] {v['check']} | {v['object_id']} | {v['message']}", flush=True)
 
-    baseline = None
-    if baseline_manifest is not None:
-        baseline = run_baseline_engine(extraction.model_dump(by_alias=True, exclude_none=True), baseline_manifest, material)
+    baseline = repair.baseline
+    if baseline is not None:
         print(f"场景基准：通过 {baseline['passed']} / 告警 {baseline['warnings']} / 失败 {baseline['failures']}",
               flush=True)
         for i in baseline["items"]:
@@ -83,7 +79,6 @@ def run_extraction() -> None:
             "baseline_seconds": baseline_stage.get("elapsed_seconds", 0),
             "extraction_seconds": round(execution.elapsed_seconds, 3),
             "repair_seconds": repair.elapsed_seconds,
-            "final_validation_seconds": round(perf_counter() - validation_started, 3),
             "total_before_save_seconds": round(perf_counter() - run_started, 3),
         },
     )

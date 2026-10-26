@@ -1,13 +1,14 @@
 """通用回归：多对象/同名主体/未知/合法自关联，全部离线，不调用 main。"""
 
 import unittest
+from copy import deepcopy
 from unittest.mock import patch
 
 from audit.baseline_engine import run_baseline_engine
 from research_agent.schemas.baseline import FieldFact, MaterialFact, MaterialManifest, RelationFact
 from research_agent.services.baseline_generator import self_check_manifest, parse_manifest_response
 from research_agent.services.checks import (check_model_relations, check_option_source_dedup,
-                                          check_conditional_readonly, check_delete_policy_support)
+                                          check_conditional_readonly, check_delete_policy_support, run_checks)
 from langchain.messages import AIMessage
 from research_agent.config import Settings
 from research_agent.schemas.design import ExtractionResult
@@ -245,6 +246,41 @@ class GeneralReviewTests(unittest.TestCase):
         model.assert_not_called()
         self.assertEqual(result.records, [])
 
+    def test_unchanged_candidate_is_checked_once_even_with_zero_repair_rounds(self):
+        for rounds, value in ((2, "生效"), (0, "停用")):
+            with self.subTest(rounds=rounds):
+                candidate, manifest, source = self.repair_fixture(value)
+                expected_checks = run_checks(candidate.model_dump(by_alias=True, exclude_none=True), source)
+                expected_baseline = run_baseline_engine(
+                    candidate.model_dump(by_alias=True, exclude_none=True), manifest, source)
+                with (
+                    patch("research_agent.services.repair.run_checks", wraps=run_checks) as checks,
+                    patch("research_agent.services.repair.run_baseline_engine", wraps=run_baseline_engine) as baseline,
+                    patch("research_agent.services.repair.ChatDeepSeek") as model,
+                ):
+                    result = repair_extraction(candidate, Settings(model_params={}, max_check_rounds=rounds),
+                                               source, "", {}, manifest)
+                checks.assert_called_once()
+                baseline.assert_called_once()
+                model.assert_not_called()
+                self.assertIs(result.extraction, candidate)
+                self.assertEqual(result.checks, expected_checks)
+                self.assertEqual(result.baseline, expected_baseline)
+                self.assertEqual(result.records, [])
+
+    def test_missing_manifest_returns_none_without_baseline_check(self):
+        candidate, _, source = self.repair_fixture("生效")
+        with (
+            patch("research_agent.services.repair.run_checks", wraps=run_checks) as checks,
+            patch("research_agent.services.repair.run_baseline_engine") as baseline,
+            patch("research_agent.services.repair.ChatDeepSeek") as model,
+        ):
+            result = repair_extraction(candidate, Settings(model_params={}), source, "", {}, None)
+        checks.assert_called_once()
+        baseline.assert_not_called()
+        model.assert_not_called()
+        self.assertIsNone(result.baseline)
+
     def test_local_repair_is_merged_and_new_broken_reference_rolls_back(self):
         candidate, manifest, source = self.repair_fixture("停用")
         for broken in (False, True):
@@ -257,13 +293,72 @@ class GeneralReviewTests(unittest.TestCase):
             revision = ExtractionRepair.model_validate({"replacements": [{
                 "target_id": "f", "replacement": replacement, "changed_fields": fields,
                 "reason": "按原文明示默认值修正", "evidence": [source]}]})
-            with patch("research_agent.services.repair.ChatDeepSeek") as model:
+            with (
+                patch("research_agent.services.repair.ChatDeepSeek") as model,
+                patch("research_agent.services.repair.run_checks", wraps=run_checks) as checks,
+                patch("research_agent.services.repair.run_baseline_engine", wraps=run_baseline_engine) as baseline,
+            ):
                 model.return_value.with_structured_output.return_value.invoke.return_value = {"parsed": revision}
-                result = repair_extraction(candidate, Settings(model_params={}, max_check_rounds=1),
+                result = repair_extraction(candidate, Settings(model_params={}, max_check_rounds=2),
                                            source, "", {}, manifest)
+            attempts = 2 if broken else 1
+            self.assertEqual(len(result.records), attempts)
+            self.assertEqual(checks.call_count, 1 + attempts)
+            self.assertEqual(baseline.call_count, 1 + attempts)
+            self.assertEqual(result.checks, run_checks(result.extraction.model_dump(by_alias=True, exclude_none=True), source))
+            self.assertEqual(result.baseline, run_baseline_engine(
+                result.extraction.model_dump(by_alias=True, exclude_none=True), manifest, source))
             self.assertEqual(result.records[0]["accepted"], not broken)
             self.assertEqual(result.extraction.objects[-1].data.defaultValue, "停用" if broken else "生效")
             self.assertEqual([o.data.id for o in result.extraction.objects], [o.data.id for o in candidate.objects])
+
+    def test_rejected_second_patch_keeps_last_accepted_candidate_and_checks(self):
+        candidate, manifest, source = self.repair_fixture("停用")
+        payload = candidate.model_dump(by_alias=True, exclude_none=True)
+        payload["objects"][2]["data"]["pageGroup"] = "missing_group"
+        candidate = ExtractionResult.model_validate(payload)
+        fixed = candidate.objects[-1].model_dump(by_alias=True, exclude_none=True)
+        fixed["data"]["defaultValue"] = "生效"
+        broken = deepcopy(fixed)
+        broken["data"]["bind"] = "missing_attribute"
+        revisions = [ExtractionRepair.model_validate({"replacements": [{
+            "target_id": "f", "replacement": replacement, "changed_fields": [field],
+            "reason": "按原文修正", "evidence": [source]}]})
+            for replacement, field in ((fixed, "data.defaultValue"), (broken, "data.bind"))]
+        with (
+            patch("research_agent.services.repair.run_checks", wraps=run_checks) as checks,
+            patch("research_agent.services.repair.run_baseline_engine", wraps=run_baseline_engine) as baseline,
+            patch("research_agent.services.repair.ChatDeepSeek") as model,
+        ):
+            model.return_value.with_structured_output.return_value.invoke.side_effect = [
+                {"parsed": revision} for revision in revisions]
+            result = repair_extraction(candidate, Settings(model_params={}, max_check_rounds=2),
+                                       source, "", {}, manifest)
+        self.assertEqual([row["accepted"] for row in result.records], [True, False])
+        self.assertEqual(checks.call_count, 3)
+        self.assertEqual(baseline.call_count, 3)
+        self.assertEqual(result.extraction.objects[-1].data.defaultValue, "生效")
+        self.assertEqual(result.extraction.objects[-1].data.bind, "a")
+        self.assertEqual(result.baseline["coverage"], {"structured": 1})
+        self.assertEqual(result.checks, run_checks(result.extraction.model_dump(by_alias=True, exclude_none=True), source))
+
+    def test_invalid_repair_response_reuses_original_check_results(self):
+        candidate, manifest, source = self.repair_fixture("停用")
+        with (
+            patch("research_agent.services.repair.run_checks", wraps=run_checks) as checks,
+            patch("research_agent.services.repair.run_baseline_engine", wraps=run_baseline_engine) as baseline,
+            patch("research_agent.services.repair.ChatDeepSeek") as model,
+        ):
+            model.return_value.with_structured_output.return_value.invoke.return_value = {
+                "parsed": None, "parsing_error": "invalid JSON"}
+            result = repair_extraction(candidate, Settings(model_params={}, max_check_rounds=2),
+                                       source, "", {}, manifest)
+        checks.assert_called_once()
+        baseline.assert_called_once()
+        self.assertIs(result.extraction, candidate)
+        self.assertEqual(len(result.records), 2)
+        self.assertTrue(all(not row["accepted"] for row in result.records))
+        self.assertEqual(result.baseline["coverage"], {"conflict": 1})
 
     def test_undeclared_repair_field_change_is_rejected(self):
         candidate, _, source = self.repair_fixture("停用")

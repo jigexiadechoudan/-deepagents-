@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -27,7 +28,7 @@ from research_agent.services.baseline_generator import BaselineGeneration, self_
 from research_agent.services.execution import execute_agent
 from research_agent.services.materials import load_material, load_reference
 from research_agent.services.validation import get_retry_error
-from research_agent.services.repair import RepairExecution
+from research_agent.services.repair import RepairExecution, repair_extraction
 
 
 MODEL_PARAMS = {
@@ -119,6 +120,10 @@ class RefactorTests(unittest.TestCase):
 
     def run_workflow(self, replies, expect_failure=False, extra_patches=None):
         agent = FakeAgent(replies)
+
+        def check_without_repair(candidate, settings, *args):
+            return repair_extraction(candidate, replace(settings, max_check_rounds=0), *args)
+
         patches = {
             "research_agent.workflow.load_settings": patch(
                 "research_agent.workflow.load_settings", return_value=self.settings),
@@ -132,7 +137,7 @@ class RefactorTests(unittest.TestCase):
                     "field_table": {"status": "matched"}}),
             "research_agent.workflow.repair_extraction": patch(
                 "research_agent.workflow.repair_extraction",
-                side_effect=lambda candidate, *args, **kwargs: RepairExecution(candidate)),
+                side_effect=check_without_repair),
         }
         patches.update(extra_patches or {})
         with (
@@ -289,6 +294,36 @@ class RefactorTests(unittest.TestCase):
         self.assertEqual(records[record["result_file"]],
                          successful_result()["structured_response"].model_dump(by_alias=True, exclude_none=True))
         self.assertEqual(len(records), 2)
+
+    def test_workflow_saves_returned_checks_without_rechecking(self):
+        candidate = successful_result()["structured_response"]
+        checks = [{"check": "review", "severity": "warning", "object_id": "page_1",
+                   "message": "保留检查结果"}]
+        baseline = {
+            "passed": 1, "warnings": 0, "failures": 0,
+            "coverage": {"structured": 1}, "source_review": {"review_required": 0},
+            "coverage_scope": "generated_facts_only", "business_completeness": "not_proven",
+            "items": [{"check": "fact:0", "status": "pass", "coverage": "structured",
+                       "detail": "保留通过项"}],
+        }
+        repair = RepairExecution(candidate, checks=checks, baseline=baseline, elapsed_seconds=0.5)
+        with (
+            patch("research_agent.services.repair.run_checks", side_effect=AssertionError("不应重新检查")),
+            patch("research_agent.services.repair.run_baseline_engine", side_effect=AssertionError("不应重新核对")),
+        ):
+            _, records = self.run_workflow([successful_result()], extra_patches={
+                "research_agent.workflow.repair_extraction": patch(
+                    "research_agent.workflow.repair_extraction", return_value=repair),
+                "research_agent.workflow._load_baseline_manifest": patch(
+                    "research_agent.workflow._load_baseline_manifest",
+                    return_value=({}, {"source": "test", "review_status": "reviewed"})),
+            })
+        record = next(value for name, value in records.items() if name.startswith("run_"))
+        self.assertEqual(record["checks"]["items"], checks)
+        self.assertEqual(record["baseline_check"], baseline)
+        self.assertEqual(record["coverage_summary"], {"structured": 1})
+        self.assertEqual(record["stage_timings"]["repair_seconds"], 0.5)
+        self.assertNotIn("final_validation_seconds", record["stage_timings"])
 
     def test_baseline_manifest_roundtrip_from_converted_file(self):
         path = PROJECT_DIR / "baselines" / "八达光电_客户料号映射_smardaten配置方案.json"
