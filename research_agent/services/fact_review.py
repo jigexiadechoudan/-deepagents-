@@ -13,6 +13,13 @@ def normalize(value) -> str:
     return re.sub(r"\s+", "", text)
 
 
+def canonical_page_kind(value):
+    name = normalize(value).casefold()
+    return {"列表": "list", "列表页": "list", "列表页面": "list",
+            "表单": "form", "表单页": "form", "表单页面": "form",
+            "详情": "detail", "详情页": "detail", "详情页面": "detail"}.get(name, name)
+
+
 def strings(value):
     if isinstance(value, str):
         yield value
@@ -27,6 +34,14 @@ def strings(value):
 
 def text(value):
     return "\n".join(strings(value))
+
+
+def narrative_text(data):
+    """覆盖只查本对象的实际描述与逻辑，不用名称、技术 ID 或待确认内容充数。"""
+    fields = ("note", "constraint", "description", "purpose", "boundary", "caliber", "queryNote",
+              "openLogic", "saveLogic", "createLogic", "logic", "condition", "effect", "mainFlow",
+              "exceptionPaths", "preconditions", "outcomes", "filterNote", "scope", "acceptance")
+    return "\n".join(text(data.get(field)) for field in fields if data.get(field) is not None)
 
 
 def source_support(fact: MaterialFact, material: str) -> str:
@@ -163,7 +178,7 @@ class CandidateIndex:
         page = self.page(data)
         if scope.page and not self.named(page, scope.page):
             return False
-        if scope.pageKind and page.get("kind") != scope.pageKind:
+        if scope.pageKind and canonical_page_kind(page.get("kind")) != canonical_page_kind(scope.pageKind):
             return False
         if scope.block:
             block = data if obj["object_type"] == "Block" else self.by_id.get(data.get("block"), {}).get("data", {})
@@ -178,7 +193,7 @@ class CandidateIndex:
                     return False
         return True
 
-    def candidates(self, fact):
+    def candidates(self, fact, match_subject=True):
         kinds = {
             "object": set(),
             "attribute": {"Attribute"}, "field_view": {"FieldView"},
@@ -204,9 +219,12 @@ class CandidateIndex:
                 if fact.scope.targetField and not self.named(self.by_id.get((data.get("to") or {}).get("attribute"), {}).get("data", {}), fact.scope.targetField):
                     continue
                 anchor = fact.scope.object and fact.scope.targetObject
-                if not anchor and not self.named(data, fact.subject):
+                if match_subject and not anchor and not self.named(data, fact.subject):
                     continue
             elif not self.scoped(obj, fact.scope):
+                continue
+            if not match_subject:
+                out.append(obj)
                 continue
             if fact.kind in {"lifecycle", "constraint"}:
                 if normalize(fact.subject) not in normalize(text(data)):
@@ -217,6 +235,26 @@ class CandidateIndex:
                     continue
             out.append(obj)
         return out
+
+    def locate(self, fact):
+        """放宽条件仅用于解释失败，不把诊断候选当作已匹配对象。"""
+        matches = self.candidates(fact)
+        if matches:
+            return matches, {"reason_code": "matched" if len(matches) == 1 else "ambiguous_match",
+                             "candidate_ids": [obj["data"].get("id") for obj in matches]}
+        unscoped = fact.model_copy(update={"scope": fact.scope.model_copy(update={
+            name: None for name in type(fact.scope).model_fields})})
+        named = self.candidates(unscoped)
+        if named:
+            return [], {"reason_code": "scope_mismatch",
+                        "candidate_ids": [obj["data"].get("id") for obj in named][:5]}
+        scoped = self.candidates(fact, match_subject=False)
+        if scoped:
+            return [], {"reason_code": "name_unresolved",
+                        "candidate_ids": [obj["data"].get("id") for obj in scoped][:5]}
+        pool = self.candidates(unscoped, match_subject=False)
+        return [], {"reason_code": "scope_mismatch" if pool else "no_candidate",
+                    "candidate_ids": [obj["data"].get("id") for obj in pool][:5]}
 
 
 def get_path(data, path):
@@ -258,25 +296,42 @@ def review_facts(extraction, manifest, material):
                "evidence": fact.evidence,
                "locations": [s.model_dump() if hasattr(s, "model_dump") else s for s in fact.locations]}
 
-        def result(coverage, detail, status="warn"):
-            items.append({**row, "coverage": coverage, "detail": detail, "status": status})
+        def result(coverage, detail, status="warn", reason_code=None, literal_covered=False):
+            content = {"structured": "covered", "text": "covered", "partial": "partial",
+                       "uncovered": "not_found", "conflict": "conflict", "review": "unverified",
+                       "not_checked": "unknown"}[coverage]
+            structure = {"structured": "structured", "text": "text_only"}.get(coverage, "unverified")
+            if literal_covered:
+                content, structure = "covered", "structured"
+            items.append({**row, "coverage": coverage, "detail": detail, "status": status,
+                          "reason_code": reason_code or coverage, "content_coverage": content,
+                          "structure_coverage": structure,
+                          "semantic_review": coverage == "review" or fact.kind in {"lifecycle", "constraint", "rule"}
+                                             or isinstance(fact.expected, list),
+                          "omission_confirmed": False})
 
         if fact.state == "unknown":
             candidates = index.candidates(fact)
             if len(candidates) == 1 and get_path(candidates[0]["data"], fact.property) is not None:
-                result("review", "材料未明确，候选却填写了该属性；需核对推断依据")
+                result("review", "材料未明确，候选却填写了该属性；需核对推断依据",
+                       reason_code="value_without_source")
             else:
-                result("not_checked", "材料未明确，不产生取值断言", "skip")
+                result("not_checked", "材料未明确，不产生取值断言", "skip", "material_unknown")
             continue
         if fact.state == "conflict" or fact.verification == "review":
-            result("review", "检查要求的来源或语义待复核，不用于强制修复")
+            result("review", "检查要求的来源或语义待复核，不用于强制修复", reason_code="source_review")
             continue
-        candidates = index.candidates(fact)
+        candidates, matching = index.locate(fact)
+        row["matching"] = matching
         if not candidates:
-            result("uncovered", "未定位承接对象；可能遗漏或命名映射不同，需要核对")
+            reason = matching["reason_code"]
+            detail = {"scope_mismatch": "未在指定作用域定位对象；名称或同类候选出现在其他上下文，需核对作用域",
+                      "name_unresolved": "作用域内有同类对象，但名称未匹配；需核对名称映射或漏提",
+                      "no_candidate": "未找到同类候选；需人工核对是否漏提，不能仅凭自动匹配确认遗漏"}[reason]
+            result("review", detail, reason_code=reason)
             continue
         if len(candidates) != 1:
-            result("review", "同名或上下文不唯一，不能任取第一项判定")
+            result("review", "同名或上下文不唯一，不能任取第一项判定", reason_code="ambiguous_match")
             continue
         data = candidates[0]["data"]
         row["object_id"] = data.get("id")
@@ -287,28 +342,38 @@ def review_facts(extraction, manifest, material):
         if actual is not None and equivalent(actual, fact.expected, data, index):
             # 自由文本只确认字面承接，不能证明条件、顺序和否定都正确。
             if isinstance(fact.expected, list) or fact.kind in {"lifecycle", "constraint", "rule"}:
-                result("review", "当前对象已找到检查片段，条件与顺序仍需语义复核")
+                result("review", "当前对象已找到检查片段，条件与顺序仍需语义复核",
+                       reason_code="logic_review", literal_covered=True)
             else:
                 result("structured", "属性已匹配", "pass")
             continue
         expected_parts = fact.expected if isinstance(fact.expected, list) else [fact.expected]
-        notes = normalize(text(data))
+        notes = normalize(narrative_text(data))
         in_text = all(v is not None and normalize(v) and normalize(v) in notes for v in expected_parts)
         if actual is None and in_text:
-            result("text", "已在本对象文字中承接，专门属性未填写")
+            if isinstance(fact.expected, (bool, int, float)):
+                result("review", "文字中出现相同值，但尚不能证明对应此属性", reason_code="literal_value_ambiguous")
+            else:
+                result("text", "已在本对象文字中承接，专门属性未填写", reason_code="text_coverage")
         elif actual is None:
             result("partial" if any(normalize(v) in notes for v in expected_parts if v is not None) else "uncovered",
-                   "当前对象的承接不完整，或措辞不同需复核")
+                   "当前属性及文字未完整匹配要求；需核对同义表达或实际遗漏", reason_code="property_not_matched")
         elif isinstance(fact.expected, (bool, int)) or fact.property in {"cardinality", "defaultValue", "value", "capacity.maxLength"}:
             result("conflict", f"当前属性 {actual!r} 与有据期望 {fact.expected!r} 不一致", "fail")
         else:
-            result("review", "属性表述不同，需要语义复核，不能只按关键词判错")
+            result("review", "属性表述不同，需要语义复核，不能只按关键词判错", reason_code="expression_review")
     counts = Counter(i["coverage"] for i in items)
     return {
         "protocol_version": 2, "passed": sum(i["status"] == "pass" for i in items),
         "warnings": sum(i["status"] == "warn" for i in items),
         "failures": sum(i["status"] == "fail" for i in items),
         "coverage": dict(counts), "source_review": source_report,
+        "coverage_dimensions": {
+            "content": dict(Counter(i["content_coverage"] for i in items)),
+            "structure": dict(Counter(i["structure_coverage"] for i in items)),
+        },
+        "diagnostic_counts": dict(Counter(i["reason_code"] for i in items)),
+        "omission_confirmation": "requires_independent_review",
         "coverage_scope": "generated_facts_only", "business_completeness": "not_proven",
         "items": items,
     }

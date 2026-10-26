@@ -17,10 +17,10 @@ def _load_baseline_manifest(settings, material: str, reference: str, skill_files
     return load_baseline(settings, material, reference, skill_files)
 
 
-def run_extraction() -> None:
+def run_extraction(*, thinking: bool = False) -> None:
     run_started = perf_counter()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    settings = load_settings()
+    settings = load_settings(thinking=thinking)
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     material = load_material(settings.material_path)
     reference = load_reference(settings.reference_path)

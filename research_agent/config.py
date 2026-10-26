@@ -29,7 +29,7 @@ class Settings:
     skill_dir: Path = PROJECT_DIR / "research_agent" / "skills" / "design-model-extraction"
 
 
-def load_settings() -> Settings:
+def load_settings(*, thinking: bool = False) -> Settings:
     load_dotenv(PROJECT_DIR / ".env")
     if not os.getenv("DEEPSEEK_API_KEY"):
         raise ValueError("请先在 .env 中填写 DEEPSEEK_API_KEY")
@@ -41,6 +41,6 @@ def load_settings() -> Settings:
             "timeout": 180,
             "max_retries": 1,
             "max_tokens": 65536,
-            "extra_body": {"thinking": {"type": "disabled"}},
+            "extra_body": {"thinking": {"type": "enabled" if thinking else "disabled"}},
         }
     )

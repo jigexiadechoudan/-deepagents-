@@ -1,6 +1,6 @@
 from deepagents import create_deep_agent
 from langchain.agents.structured_output import ToolStrategy
-from langchain_deepseek import ChatDeepSeek
+from research_agent.agent.model import ChatDeepSeek
 
 from research_agent.agent.middleware import StructuredOutputRepairMiddleware
 from research_agent.agent.prompts import build_system_prompt

@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any
 from langchain.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.messages import BaseMessage
 
+from research_agent.services.checks import review_report_entries
+
 if TYPE_CHECKING:
     from research_agent.config import Settings
     from research_agent.schemas.design import ExtractionResult
@@ -98,7 +100,8 @@ def _transcript(messages: list[BaseMessage]) -> list[dict[str, Any]]:
                 row["invalid"] = [call["name"] for call in message.invalid_tool_calls]
         if isinstance(message, ToolMessage):
             content = message.content if isinstance(message.content, str) else ""
-            if content.startswith("Error: ") and message.status != "error":
+            if message.additional_kwargs.get("schema_validation_error") or (
+                    content.startswith("Error: ") and message.status != "error"):
                 row["schema_feedback"] = content[:600]
             elif message.status == "error":
                 row["tool_error"] = content[:300]
@@ -179,6 +182,10 @@ def save_success(
         "business_completeness": "not_independently_reviewed",
         "structure_status": "schema_valid",
         "coverage_summary": (baseline or {}).get("coverage", {}),
+        "coverage_dimensions": (baseline or {}).get("coverage_dimensions", {}),
+        "coverage_diagnostics": (baseline or {}).get("diagnostic_counts", {}),
+        "report_review": review_report_entries({name: getattr(extraction, name)
+                                                for name in ("omissions", "unknowns", "conflicts")}),
         "coverage_scope": (baseline or {}).get("coverage_scope", "not_checked"),
         "unchecked": {
             "coverage": baseline is None or not (baseline or {}).get("items"),

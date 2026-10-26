@@ -25,6 +25,8 @@ def input_fingerprints(settings: Settings, material: str, reference: str, skill_
         "research_agent/schemas/repair.py", "research_agent/services/baseline_store.py",
         "research_agent/schemas/vocabulary.py",
         "research_agent/services/fact_review.py",
+        "research_agent/agent/middleware.py",
+        "research_agent/agent/model.py", "research_agent/agent/factory.py",
     ]
     field_table = settings.reference_path.parent / "图片和附件" / "设计模型-字段总表.xlsx"
     return {
