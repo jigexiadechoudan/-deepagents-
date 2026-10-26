@@ -10,18 +10,13 @@ import difflib
 import json
 import re
 import sys
-from typing import Any
+from typing import Any, get_args
+
+from research_agent.schemas.typed import _DATA_BY_TYPE
+from research_agent.schemas.vocabulary import BusinessType, ControlType, RealizationType, VisibilityType
 
 # 规范来源：基础资料/设计模型/设计模型.md 的对象目录（39 种）
-VALID_OBJECT_TYPES = {
-    "Project", "ExistingSystem", "ExternalDataSource", "ExternalService",
-    "Application", "Actor", "dataObject", "Attribute", "Relation", "DataSet",
-    "DataView", "DataService", "Integration", "Automation", "Database",
-    "Module", "Navigation", "Feature", "Process", "ProcessStep", "Permission",
-    "PageGroup", "Page", "Block", "BlockRule", "FieldView", "OptionSource",
-    "Option", "Action", "Artifact", "ChangeIntent", "ChangeSet", "Deliverable",
-    "Proposal", "Requirement", "ResearchStep", "Role", "Validation", "Version",
-}
+VALID_OBJECT_TYPES = set(_DATA_BY_TYPE)
 
 ID_PREFIXES = (
     "attr_", "entity_", "rel_", "page_", "pg_", "blk_", "fv_", "act_",
@@ -30,15 +25,13 @@ ID_PREFIXES = (
     "sys_", "int_", "dsv_", "proc_", "step_", "art_", "req_",
 )
 
-# 词表来源：Skill v2.3.x 术语闭集（设计模型示例 + 采购库存 demo 实值）
+# 词表来源：字段总表的明确取值列；不再将旧 Skill 的示例子集当成全集。
 VOCAB = {
-    "control": {"text", "number", "amount", "date", "choice", "reference",
-                "switch", "person"},
+    "control": set(get_args(ControlType)),
     "kind": {"reference", "fixed"},          # 仅限 OptionSource/Option
-    "visibility": {"always", "conditional"},
-    "realization": {"structured", "partial"},
-    "bizType": {"text", "number", "integer", "amount", "date", "choice",
-                "reference", "boolean", "person", "datetime"},
+    "visibility": set(get_args(VisibilityType)),
+    "realization": set(get_args(RealizationType)),
+    "bizType": set(get_args(BusinessType)),
 }
 
 # 值为对象 ID 的字段名；嵌套结构（如 Relation.from/to）里的同名键同样生效
@@ -48,7 +41,9 @@ REFERENCE_KEYS = {
     "displayAttribute", "actor", "actors", "primaryActors", "authority",
     "feature", "primarydataObject", "menu", "database", "module", "parent",
     "application", "project", "attribute", "coveredBy", "writes", "inputs",
-    "outputs", "serves", "homepage",
+    "outputs", "serves", "homepage", "entry", "embeddedPage", "systems",
+    "dataSources", "services", "defaultOptionSource", "system",
+    "dataSet", "process", "action", "statedataObject", "reads",
 }
 
 OMISSION_SUSPECT = re.compile(r"原文没有|材料未|原文未|未给出|未说明")
@@ -96,7 +91,17 @@ def check_evidence_verbatim(objects: list[dict], material: str) -> list[dict]:
     lines = [ln for ln in material.splitlines() if ln.strip()]
     candidates = lines + [f"{a}\n{b}" for a, b in zip(lines, lines[1:])]
     for obj in objects:
-        for ev in obj.get("evidence", []):
+        evidence = obj.get("evidence", [])
+        if not evidence:
+            out.append({"check": "evidence", "severity": "error",
+                        "object_id": obj.get("data", {}).get("id"),
+                        "message": "缺少支持对象的原文证据"})
+        for ev in evidence:
+            if not isinstance(ev, str) or not ev.strip():
+                out.append({"check": "evidence", "severity": "error",
+                            "object_id": obj.get("data", {}).get("id"),
+                            "message": "证据不能为空或只有空白"})
+                continue
             if ev in material:
                 continue
             oid = obj.get("data", {}).get("id")
@@ -129,30 +134,134 @@ def check_id_integrity(objects: list[dict]) -> list[dict]:
     id_set = set(ids)
     for obj in objects:
         oid = obj["data"].get("id")
-        if oid and not str(oid).startswith(ID_PREFIXES):
+        if not isinstance(oid, str) or not oid.strip():
             out.append({"check": "id", "severity": "error", "object_id": oid,
-                        "message": f"ID 前缀不在约定表：{oid}"})
+                        "message": "对象必须有非空技术 ID"})
 
         def on_kv(key: str, value: Any, oid: Any = oid) -> None:
-            if key in REFERENCE_KEYS and isinstance(value, str) and value not in id_set:
-                out.append({"check": "id", "severity": "error", "object_id": oid,
-                            "message": f"引用断链：{key} -> {value}"})
+            if key in REFERENCE_KEYS or (obj["object_type"] == "Action" and key == "target") \
+                    or (obj["object_type"] == "Automation" and key == "actions") \
+                    or (obj["object_type"] == "ProcessStep" and key == "next") \
+                    or (obj["object_type"] == "DataSet" and key in {"source", "columns", "dimensions"}) \
+                    or (obj["object_type"] == "DataView" and key == "columns"):
+                for target in value if isinstance(value, list) else [value]:
+                    if isinstance(target, str) and target not in id_set:
+                        out.append({"check": "id", "severity": "error", "object_id": oid,
+                                    "message": f"引用断链：{key} -> {target}"})
 
         _walk(obj["data"], on_kv)
     return out
 
 
 def check_option_source_dedup(objects: list[dict]) -> list[dict]:
-    seen: dict[str, list[str]] = {}
+    seen: dict[tuple, list[str]] = {}
     for obj in objects:
         if obj.get("object_type") != "OptionSource":
             continue
-        value_attr = obj["data"].get("valueAttribute")
+        data = obj["data"]
+        value_attr = data.get("valueAttribute")
         if value_attr:
-            seen.setdefault(value_attr, []).append(obj["data"].get("id"))
-    return [{"check": "option_source", "severity": "error", "object_id": None,
-             "message": f"取值来源按 {va} 重复建模：{names}"}
-            for va, names in seen.items() if len(names) > 1]
+            signature = tuple(json.dumps(data.get(key), ensure_ascii=False, sort_keys=True)
+                              for key in ("kind", "relation", "valueAttribute", "displayAttribute", "filterNote"))
+            seen.setdefault(signature, []).append(data.get("id"))
+    return [{"check": "option_source", "severity": "warning", "object_id": oid,
+             "message": f"取值来源配置相同，可复核是否合并；不同场景过滤不得强制共用：{names}"}
+            for names in seen.values() if len(names) > 1 for oid in names]
+
+
+def check_model_relations(objects: list[dict]) -> list[dict]:
+    """检查当前设计定义中的引用目标、页面归属、关系端点与包含环。"""
+    by_id = {o["data"].get("id"): o for o in objects}
+    out = []
+    targets = {
+        "application": {"Application"}, "project": {"Project"},
+        "module": {"Module"}, "feature": {"Feature"}, "pageGroup": {"PageGroup"},
+        "page": {"Page"}, "homepage": {"Page"}, "entry": {"Page"},
+        "embeddedPage": {"Page"}, "block": {"Block"}, "bind": {"Attribute"},
+        "attribute": {"Attribute"}, "valueAttribute": {"Attribute"},
+        "displayAttribute": {"Attribute"}, "optionSource": {"OptionSource"},
+        "defaultOptionSource": {"OptionSource"}, "relation": {"Relation"},
+        "database": {"Database"}, "actor": {"Actor"}, "actors": {"Actor"},
+        "primaryActors": {"Actor"}, "authority": {"Actor"}, "serves": {"Feature"},
+        "dataObject": {"dataObject"}, "primarydataObject": {"dataObject"},
+        "sourcedataObject": {"dataObject"}, "targetdataObject": {"dataObject"},
+        "statedataObject": {"dataObject"}, "systems": {"ExistingSystem"},
+        "system": {"ExistingSystem"}, "menu": {"Navigation"},
+        "dataSources": {"ExternalDataSource"}, "services": {"ExternalService"},
+        "dataSet": {"DataSet"}, "process": {"Process"}, "action": {"Action"},
+    }
+
+    def error(oid, message):
+        out.append({"check": "model_relation", "severity": "error",
+                    "object_id": oid, "message": message})
+
+    for obj in objects:
+        data, kind = obj["data"], obj["object_type"]
+        oid = data.get("id")
+
+        def target_type(key, value):
+            allowed = targets.get(key)
+            if key == "target" and kind == "Action":
+                allowed = {"Page"}
+            if key == "parent" and kind in {"Block", "Navigation"}:
+                allowed = {kind}
+            if key == "source" and kind == "DataSet":
+                allowed = {"dataObject"}
+            if key in {"columns", "dimensions"} and kind in {"DataSet", "DataView"}:
+                allowed = {"Attribute"}
+            if key == "actions" and kind == "Automation":
+                allowed = {"Action"}
+            if key == "next" and kind == "ProcessStep":
+                allowed = {"ProcessStep"}
+            if not allowed:
+                return
+            for ref in value if isinstance(value, list) else [value]:
+                target = by_id.get(ref) if isinstance(ref, str) else None
+                if target and target["object_type"] not in allowed:
+                    error(oid, f"引用类型错误：{key} -> {ref}，应指向 {sorted(allowed)}")
+
+        _walk(data, target_type)
+        if kind == "Page":
+            if not data.get("pageGroup"):
+                out.append({"check": "model_relation", "severity": "warning", "object_id": oid,
+                            "message": "Page 未承接 pageGroup 归属；若材料不足请保留具体缺口"})
+            if not any(o["object_type"] == "Block" and o["data"].get("page") == oid
+                       for o in objects):
+                out.append({"check": "model_relation", "severity": "warning", "object_id": oid,
+                            "message": "Page 尚无 Block；区分材料未给细节与提取遗漏"})
+        if kind == "Relation":
+            for end_name in ("from", "to"):
+                end = data.get(end_name) or {}
+                if not end.get("dataObject"):
+                    error(oid, f"Relation.{end_name} 缺少 dataObject 端点")
+                attr = by_id.get(end.get("attribute"), {}).get("data")
+                if attr and attr.get("dataObject") != end.get("dataObject"):
+                    error(oid, f"Relation.{end_name}.attribute 不属于端点 dataObject")
+        if kind == "Block" and isinstance(data.get("parent"), str) and data["parent"] in by_id:
+            parent = by_id[data["parent"]]["data"]
+            if parent.get("page") != data.get("page"):
+                error(oid, "父子 Block 必须归属同一个 Page")
+        if kind == "Action" and data.get("block") in by_id:
+            block = by_id[data["block"]]["data"]
+            if data.get("page") and block.get("page") != data["page"]:
+                error(oid, "Action.page 与所属 Block.page 不一致")
+        if kind == "Database":
+            for index in data.get("indexing") or []:
+                for ref in index.get("fields") or []:
+                    attribute = by_id.get(ref) if isinstance(ref, str) else None
+                    if not attribute or attribute["object_type"] != "Attribute":
+                        error(oid, f"索引字段必须指向存在的 Attribute：{ref}")
+                    elif attribute["data"].get("dataObject") != index.get("dataObject"):
+                        error(oid, f"索引字段不属于指定 dataObject：{ref}")
+        if kind in {"Block", "Navigation"}:
+            seen, cursor = {oid}, data.get("parent")
+            while isinstance(cursor, str) and cursor in by_id:
+                if cursor in seen:
+                    error(oid, "parent 包含关系成环")
+                    break
+                seen.add(cursor)
+                cursor = by_id[cursor]["data"].get("parent")
+    return out
 
 
 def check_vocabulary(objects: list[dict]) -> list[dict]:
@@ -187,13 +296,26 @@ def check_blockrule_condition(objects: list[dict]) -> list[dict]:
             and not obj.get("data", {}).get("condition")]
 
 
-def check_status_assertions(objects: list[dict]) -> list[dict]:
-    return [{"check": "status", "severity": "error",
+def check_partial_open_items(objects: list[dict]) -> list[dict]:
+    """部分设计或意图必须把具体缺口留在自身，不能只标状态或散落全局未知。"""
+    return [{"check": "open_item", "severity": "warning",
              "object_id": obj["data"].get("id"),
-             "message": "Artifact.status=confirmed 无材料依据（调用方材料是待分析输入）"}
+             "message": "partial/intent 对象缺少包含具体问题的 openItem"}
+            for obj in objects if obj["data"].get("realization") in {"partial", "intent"}
+            and not any(isinstance(item, dict) and isinstance(item.get("statement"), str)
+                        and item["statement"].strip()
+                        for key in ("openItem", "note") for item in obj["data"].get(key) or [])]
+
+
+def check_status_assertions(objects: list[dict]) -> list[dict]:
+    return [{"check": "status", "severity": "warning",
+             "object_id": obj["data"].get("id"),
+             "message": "Artifact.status=confirmed 需要对应确认依据，不能由工具自动确认"}
             for obj in objects
             if obj.get("object_type") == "Artifact"
-            and obj.get("data", {}).get("status") == "confirmed"]
+            and obj.get("data", {}).get("status") == "confirmed"
+            and not any(re.search(r"已确认|已审核|已批准|confirmed|approved", ev, re.I)
+                        for ev in obj.get("evidence", []))]
 
 
 def check_primary_inference(objects: list[dict]) -> list[dict]:
@@ -213,6 +335,28 @@ def check_primary_inference(objects: list[dict]) -> list[dict]:
     return out
 
 
+def check_conditional_readonly(objects: list[dict]) -> list[dict]:
+    out = []
+    for obj in objects:
+        data = obj["data"]
+        if obj["object_type"] != "FieldView" or data.get("readonly") is not True:
+            continue
+        notes = " ".join(str(item.get("statement", "")) for item in data.get("note") or [])
+        if "新增态可填" in notes and re.search(r"编辑态.{0,10}禁用", notes):
+            out.append({"check": "conditional_readonly", "severity": "error", "object_id": data.get("id"),
+                        "field": "data.readonly",
+                        "message": "readonly=true 与对象自身明确的新增态可填、编辑态禁用相冲突；保留条件逻辑，不能声明始终只读"})
+    return out
+
+
+def check_delete_policy_support(objects: list[dict]) -> list[dict]:
+    return [{"check": "source_support", "severity": "warning",
+             "object_id": obj["data"].get("id"), "field": "data.onDelete",
+             "message": "关系填写了删除策略，但对象证据未提及删除；需复核，不能由只读引用或示例推出"}
+            for obj in objects if obj["object_type"] == "Relation" and obj["data"].get("onDelete") is not None
+            and not any(re.search(r"删除|级联|delete|cascade", ev, re.I) for ev in obj.get("evidence", []))]
+
+
 def run_checks(extraction: dict, material: str) -> list[dict]:
     """总入口：返回违规清单（error / warning）。"""
     objects = extraction.get("objects", [])
@@ -220,12 +364,16 @@ def run_checks(extraction: dict, material: str) -> list[dict]:
     violations += check_evidence_verbatim(objects, material)
     violations += check_object_type(objects)
     violations += check_id_integrity(objects)
+    violations += check_model_relations(objects)
     violations += check_option_source_dedup(objects)
     violations += check_vocabulary(objects)
     violations += check_omissions_phrasing(extraction.get("omissions", []))
     violations += check_blockrule_condition(objects)
+    violations += check_partial_open_items(objects)
     violations += check_status_assertions(objects)
     violations += check_primary_inference(objects)
+    violations += check_conditional_readonly(objects)
+    violations += check_delete_policy_support(objects)
     return violations
 
 

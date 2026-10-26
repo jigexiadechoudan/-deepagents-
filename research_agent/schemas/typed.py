@@ -7,7 +7,9 @@ null 规则）；身份字段（id 与各类型的核心引用）必填。改字
 
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from research_agent.schemas.vocabulary import BusinessType, ControlType, RealizationType, VisibilityType
 
 
 class NoteItem(BaseModel):
@@ -41,6 +43,23 @@ class RelationEnd(BaseModel):
     model_config = ConfigDict(extra="forbid")
     dataObject: str
     attribute: str | None = None
+
+
+class SummaryItem(BaseModel):
+    """DataSet 内嵌汇总项，字段来自设计模型.md 的 DataSet 示例。"""
+
+    model_config = ConfigDict(extra="forbid")
+    key: str
+    label: str | None = None
+    valueAttribute: str | None = None
+    aggregation: str | None = None
+    caliber: str | None = None
+    calculation: Any = None
+    constraint: list[ConstraintItem] | None = None
+    openItem: list[OpenItemItem] | None = None
+    assumption: list[AssumptionItem] | None = None
+    quality: list[QualityItem] | None = None
+    note: list[NoteItem] | None = None
 
 class ProjectData(BaseModel):
     """Project 数据载荷。无值的键一律省略（不写 null）：只需 object_type、id 与有值的字段。"""
@@ -111,7 +130,7 @@ class ExternalServiceData(BaseModel):
     outputs: list[str] | None = None
     purpose: Any = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     syncMode: Any = None
     system: Any = None
 
@@ -137,7 +156,7 @@ class ApplicationData(BaseModel):
     project: Any = None
     purpose: Any = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     systems: list[str] | None = None
     theme: dict[str, Any] | None = None
 
@@ -175,7 +194,7 @@ class DataObjectData(BaseModel):
     openItem: list[OpenItemItem] | None = None
     physicalName: Any = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
 
 class AttributeData(BaseModel):
     """Attribute 数据载荷。无值的键一律省略（不写 null）：只需 object_type、id 与有值的字段。"""
@@ -184,7 +203,7 @@ class AttributeData(BaseModel):
     object_type: Literal["Attribute"]
     id: str
     assumption: list[AssumptionItem] | None = None
-    bizType: Literal["text", "number", "integer", "amount", "date", "choice", "reference", "boolean", "person", "datetime"] | None = None
+    bizType: BusinessType | None = None
     calculation: Any = None
     caliber: Any = None
     capacity: dict[str, Any] | None = None
@@ -202,7 +221,7 @@ class AttributeData(BaseModel):
     primary: Any = None
     quality: list[QualityItem] | None = None
     requiredField: Any = None
-    suggestedControl: Literal["text", "number", "amount", "date", "choice", "reference", "switch", "person"] | None = None
+    suggestedControl: ControlType | None = None
     unit: Any = None
 
 class RelationData(BaseModel):
@@ -222,7 +241,7 @@ class RelationData(BaseModel):
     onDelete: Any = None
     openItem: list[OpenItemItem] | None = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     to: RelationEnd | None
     usage: Any = None
 
@@ -243,9 +262,9 @@ class DataSetData(BaseModel):
     note: list[NoteItem] | None = None
     openItem: list[OpenItemItem] | None = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     source: Any = None
-    summaries: list[str] | None = None
+    summaries: list[SummaryItem] | None = None
 
 class DataViewData(BaseModel):
     """DataView 数据载荷。无值的键一律省略（不写 null）：只需 object_type、id 与有值的字段。"""
@@ -264,7 +283,7 @@ class DataViewData(BaseModel):
     note: list[NoteItem] | None = None
     openItem: list[OpenItemItem] | None = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     sourcedataObject: Any = None
 
 class DataServiceData(BaseModel):
@@ -283,7 +302,7 @@ class DataServiceData(BaseModel):
     outputs: list[str] | None = None
     quality: list[QualityItem] | None = None
     queryNote: Any = None
-    realization: Any = None
+    realization: RealizationType | None = None
     sourcedataObject: list[str] | None = None
 
 class IntegrationData(BaseModel):
@@ -305,7 +324,7 @@ class IntegrationData(BaseModel):
     outputs: Any = None
     protocol: Any = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     schedule: Any = None
     system: Any = None
     trigger: Any = None
@@ -326,7 +345,7 @@ class AutomationData(BaseModel):
     note: list[NoteItem] | None = None
     openItem: list[OpenItemItem] | None = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     schedule: Any = None
     targetdataObject: list[str] | None = None
     trigger: Any = None
@@ -352,7 +371,7 @@ class DatabaseData(BaseModel):
     openItem: list[OpenItemItem] | None = None
     partitioning: Any = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     retention: Any = None
     softDelete: Any = None
     tablePrefix: Any = None
@@ -376,7 +395,7 @@ class ModuleData(BaseModel):
     order: int | None = None
     primaryActors: list[str] | None = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     scope: Any = None
 
 class NavigationData(BaseModel):
@@ -396,7 +415,7 @@ class NavigationData(BaseModel):
     order: int | None = None
     parent: Any = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     reason: Any = None
 
 class FeatureData(BaseModel):
@@ -421,7 +440,7 @@ class FeatureData(BaseModel):
     outputs: list[str] | None = None
     preconditions: list[str] | None = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     trigger: Any = None
 
 class ProcessData(BaseModel):
@@ -439,7 +458,7 @@ class ProcessData(BaseModel):
     note: list[NoteItem] | None = None
     openItem: list[OpenItemItem] | None = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     trigger: Any = None
 
 class ProcessStepData(BaseModel):
@@ -482,7 +501,7 @@ class PermissionData(BaseModel):
     openItem: list[OpenItemItem] | None = None
     operations: Any = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     scope: Any = None
 
 class PageGroupData(BaseModel):
@@ -501,7 +520,7 @@ class PageGroupData(BaseModel):
     openItem: list[OpenItemItem] | None = None
     order: Any = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
 
 class PageData(BaseModel):
     """Page 数据载荷。无值的键一律省略（不写 null）：只需 object_type、id 与有值的字段。"""
@@ -520,7 +539,7 @@ class PageData(BaseModel):
     presentation: Any = None
     primarydataObject: Any = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     serves: list[str] | None = None
 
 class BlockData(BaseModel):
@@ -552,7 +571,7 @@ class BlockData(BaseModel):
     page: Any
     parent: Any = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     relation: Any = None
     saveLogic: list[Any] | None = None
     style: Any = None
@@ -576,7 +595,7 @@ class BlockRuleData(BaseModel):
     openItem: list[OpenItemItem] | None = None
     operations: Any = None
     quality: list[QualityItem] | None = None
-    realization: Any = None
+    realization: RealizationType | None = None
     target: Any = None
 
 class FieldViewData(BaseModel):
@@ -590,8 +609,8 @@ class FieldViewData(BaseModel):
     block: Any
     calculation: Any = None
     constraint: list[ConstraintItem] | None = None
-    control: Literal["text", "number", "amount", "date", "choice", "reference", "switch", "person"] | None = None
-    defaultValue: str | int | float | None = None
+    control: ControlType | None = None
+    defaultValue: str | int | float | bool | None = None
     displayStyle: dict[str, Any] | None = None
     filterable: Any = None
     label: str | list[str] | None
@@ -602,9 +621,9 @@ class FieldViewData(BaseModel):
     order: Any = None
     quality: list[QualityItem] | None = None
     readonly: Any = None
-    realization: Any = None
+    realization: RealizationType | None = None
     required: Any = None
-    visibility: Literal["always", "conditional"] | None = None
+    visibility: VisibilityType | None = None
     widthPreset: Any = None
 
 class OptionSourceData(BaseModel):
@@ -617,7 +636,7 @@ class OptionSourceData(BaseModel):
     constraint: list[ConstraintItem] | None = None
     displayAttribute: Any = None
     filterNote: Any = None
-    kind: Any
+    kind: Literal["fixed", "reference"]
     note: list[NoteItem] | None = None
     openItem: list[OpenItemItem] | None = None
     quality: list[QualityItem] | None = None
@@ -668,7 +687,7 @@ class ActionData(BaseModel):
     presentation: Any = None
     quality: list[QualityItem] | None = None
     reads: Any = None
-    realization: Any = None
+    realization: RealizationType | None = None
     refreshOnReturn: Any = None
     scope: Any = None
     systemKind: str | None = None
@@ -910,10 +929,19 @@ class DesignObject(BaseModel):
     ] = Field(description="设计文档中定义的对象字段，按类型强校验")
     evidence: list[str] = Field(min_length=1, description="支持这个对象的测试材料原文片段")
 
+    @field_validator("evidence")
+    @classmethod
+    def _nonblank_evidence(cls, value):
+        if any(not item.strip() for item in value):
+            raise ValueError("每条 evidence 必须是非空白原文片段")
+        return value
+
     @model_validator(mode="after")
     def _data_matches_object_type(self):
         # 无判别标签的联合可能被宽松成员吞掉最小载荷，这里强制对号入座。
         expected = _DATA_BY_TYPE[self.object_type]
+        if not self.data.id.strip():
+            raise ValueError("设计对象技术 id 不能为空白")
         if type(self.data) is not expected:
             raise ValueError(
                 f"data 应为 {expected.__name__}，实际 {type(self.data).__name__}"

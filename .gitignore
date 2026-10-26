@@ -17,8 +17,7 @@ __pycache__/
 /audit/*.md
 /audit/baseline_check.py
 /audit/parity_check.py
-/audit/analyze_auto_runs.py
-/audit/analyze_runs45.py
+/audit/analyze_*.py
 /项目优化过程记录.md
 AGENTS.md
 *.log

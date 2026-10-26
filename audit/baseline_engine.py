@@ -30,16 +30,10 @@ import sys
 from collections import Counter
 
 from research_agent.schemas.baseline import BaselineManifest
+from research_agent.schemas.typed import _DATA_BY_TYPE
 
 # 协议内置：对象类型白名单（与 v3 保持同一集合）
-KNOWN_TYPES = {
-    "Page", "FieldView", "Action", "Option", "Actor", "Relation",
-    "Module", "PageGroup", "Application", "Automation",
-    "Database", "Project", "Requirement", "Block", "OptionSource",
-    "BlockRule", "Feature", "Navigation", "Permission",
-    "DataSet", "ExistingSystem", "ExternalDataSource", "Attribute",
-    "Artifact", "DataService", "dataObject",
-}
+KNOWN_TYPES = set(_DATA_BY_TYPE)
 
 REF_TOKEN = re.compile(
     r"^(attr|entity|blk|fv|act|actor|mod|nav|pg|opt|optsrc|rel|rule|db|svc|auto|feat|app|proj|ds)_[a-z0-9_]+$"
@@ -88,9 +82,11 @@ def _keyword_hit(text: str, keyword: str) -> bool:
 
 def run_baseline_engine(extraction: dict, manifest: dict, material: str) -> dict:
     """可编程入口：清单驱动的覆盖下限核对，返回结构与 v3 一致。"""
+    if manifest.get("protocol_version") == 2:
+        from research_agent.services.fact_review import review_facts
+        return review_facts(extraction, manifest, material)
     m = BaselineManifest.model_validate(manifest)
     names = m.names
-    material_norm = normalize(material)
     objects = extraction.get("objects", [])
     gap_text = " ".join(str(x) for x in
                         extraction.get("omissions", []) + extraction.get("unknowns", []))
@@ -232,7 +228,7 @@ def run_baseline_engine(extraction: dict, manifest: dict, material: str) -> dict
     for qd in m.queryDefaults:
         q_fv = next((fv for fv in fvs_of("list")
                      if (attrs_by_id.get(fv.get("bind")) or {}).get("physicalName") == qd.physicalName
-                     and fv.get("defaultValue")), None)
+                     and fv.get("defaultValue") is not None), None)
         check(names.get(f"query_default:{qd.physicalName}", f"查询默认:{qd.physicalName}"),
               q_fv and str(q_fv.get("defaultValue")) in qd.value.split("|"),
               f"实际 {q_fv and q_fv.get('defaultValue')}")
@@ -267,11 +263,21 @@ def run_baseline_engine(extraction: dict, manifest: dict, material: str) -> dict
         check(f"关系自指:{rid}", to_obj and to_obj != frm_obj, f"{frm_obj} 指向自身")
         if m.relations:
             haystack = " ".join([str(r.get("label") or ""), str(r.get("from") or {}), str(r.get("to") or {})])
-            entry = next((e for e in m.relations
-                          if any(alt in haystack for alt in e.matchLabel.split("|"))), None)
-            if entry:
-                check(f"关系方向:{rid}", r.get("cardinality") in entry.cardinality.split("|"),
-                      f"实际 {r.get('cardinality')}")
+            # 多条目命中时取最长关键词（最具体）：避免"客户"错配到含"客户料号"的装车关系
+            best, best_len = None, 0
+            for e_rel in m.relations:
+                for alt in e_rel.matchLabel.split("|"):
+                    if alt in haystack and len(alt) > best_len:
+                        best, best_len = e_rel, len(alt)
+            if best:
+                actual = r.get("cardinality")
+                if actual is None and "|" in best.cardinality:
+                    # 材料没写基数、清单不断言方向：提取未填降级为告警
+                    check(f"关系方向:{rid}", False, f"实际 {actual}（清单未断言具体方向）",
+                          warn_only=True)
+                else:
+                    check(f"关系方向:{rid}", actual in best.cardinality.split("|"),
+                          f"实际 {actual}")
 
     # ---- 清单：材料枚举的关系必须被承接（缺失但已声明缺口=warn，静默缺失=fail）----
     for e_rel in m.relations:
@@ -419,7 +425,7 @@ def run_baseline_engine(extraction: dict, manifest: dict, material: str) -> dict
     ev_fail = []
     for o in objects:
         for ev in o.get("evidence", []):
-            if normalize(ev) not in material_norm:
+            if not ev.strip() or ev not in material:
                 ev_fail.append((o["data"].get("id") or o["object_type"], ev[:70]))
     check("证据:全部逐字命中原文", not ev_fail, f"{len(ev_fail)} 条未命中")
     for oid, ev in ev_fail:

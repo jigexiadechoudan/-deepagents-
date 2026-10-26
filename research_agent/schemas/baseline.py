@@ -1,13 +1,56 @@
-"""场景基准清单：材料事实的数据化表达；核对过程在 audit/baseline_engine.py。
+"""通用材料事实 v2：作用域、属性、原文及未知状态；旧清单结构仅供历史兼容。
 
-清单只用材料语言（中文名、物理名、按钮文字、选项值），不出现 agent 生成的
-对象 ID——清单在提取之前生成，不可能预知 ID；ID 由引擎按物理名解析。
-行为断言只开数据口子（必须含哪些关键词 / 必须为空），核对逻辑全部在引擎。
+清单使用材料中的名称和物理名，不依赖后续提取生成的技术 ID。
+v2 核对由 services.fact_review 执行，audit.baseline_engine 保留统一入口。
 """
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
+
+
+class FactScope(BaseModel):
+    """材料中的上下文名称，不依赖提取 Agent 生成的 ID。"""
+
+    model_config = ConfigDict(extra="forbid")
+    object: str | None = None
+    page: str | None = None
+    pageKind: str | None = None
+    block: str | None = None
+    field: str | None = None
+    targetObject: str | None = None
+    targetField: str | None = None
+
+
+class SourceSpan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    start: int
+    end: int
+    line: int
+
+
+class MaterialFact(BaseModel):
+    """原子材料事实；未知值不产生取值断言，语义存疑的检查交给复核。"""
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["object", "attribute", "field_view", "action", "option",
+                  "relation", "service", "lifecycle", "rule", "constraint"]
+    subject: str
+    scope: FactScope = Field(default_factory=FactScope)
+    property: str = "exists"
+    expected: JsonValue = None
+    state: Literal["explicit", "unknown", "conflict"] = "explicit"
+    evidence: list[str] = Field(default_factory=list)
+    # 偏移和核验状态由程序计算，模型不负责签发核验结论。
+    locations: list[SourceSpan] = Field(default_factory=list)
+    verification: Literal["literal", "normalized", "review"] = "review"
+
+
+class MaterialManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    protocol_version: Literal[2] = 2
+    materialName: str | None = None
+    facts: list[MaterialFact] = Field(default_factory=list)
 
 
 class MainObject(BaseModel):
@@ -40,7 +83,7 @@ class FieldFact(BaseModel):
     label: str
     physicalName: str
     type: str | None = None            # varchar(N) / datetime / text，其余类型不做断言
-    primary: bool = False
+    primary: bool | None = None
     formRequired: bool | None = None   # None = 材料未说，不做断言
     formDefault: str | None = None
     onObject: str | None = None
@@ -99,7 +142,7 @@ class RelationFact(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     matchLabel: str                    # 多候选用 | 分隔
-    cardinality: str                   # oneToMany / manyToOne / oneToMany|manyToOne
+    cardinality: str | None = None
     evidence: list[str] = Field(default_factory=list)
 
 
@@ -144,6 +187,8 @@ class BaselineManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    protocol_version: Literal[1, 2] = 1
+    facts: list[MaterialFact] = Field(default_factory=list)
     materialName: str | None = None
     names: dict[str, str] = Field(default_factory=dict)
     mainObject: MainObject | None = None

@@ -1,24 +1,22 @@
-"""循环内修复结构化输出的无效调用与内容违规。
+"""循环内仅处理结构错误；内容错误交给宿主的独立局部修复阶段。
 
 ExtractionResult 的参数 JSON 解析失败时，该调用进入 invalid_tool_calls，
 路由器因 tool_calls 为空而直接结束循环。本中间件在路由判定前拦截这种失败，
 注入带具体错误文本的反馈并跳回模型节点，让模型当场重新提交。
 
-语法合格的提交再过一遍 run_checks 语义校验：存在 error 级违规时打回重交，
-structured_response 同步置空，防止模型摆烂时旧结果静默过审；warning 不触发
-循环内打回，只留在后置报告。
+完整候选不因少量内容错误在 Agent 历史中反复重写。
 """
 
 import json
 from typing import Any
+from time import perf_counter
 
-from langchain.agents.middleware import AgentMiddleware, hook_config
-from langchain.messages import AIMessage, HumanMessage, ToolMessage
+from langchain.agents.middleware import AgentMiddleware, ModelResponse, hook_config
+from langchain.messages import AIMessage, ToolMessage
 
-from research_agent.services.checks import run_checks
+from research_agent.schemas.typed import ExtractionResult
 
 STRUCTURED_TOOL_NAME = "ExtractionResult"
-CHECK_FEEDBACK_PREFIX = "内容校验未通过："
 
 
 def find_broken_structured_calls(message: AIMessage) -> list[dict[str, Any]]:
@@ -36,17 +34,6 @@ def count_structured_failures(messages: list) -> int:
         if isinstance(message, AIMessage):
             total += len(find_broken_structured_calls(message))
     return total
-
-
-def count_check_feedbacks(messages: list) -> int:
-    """历史中语义校验打回的次数（按反馈消息前缀计数）。"""
-    return sum(
-        1
-        for message in messages
-        if isinstance(message, HumanMessage)
-        and isinstance(message.content, str)
-        and message.content.startswith(CHECK_FEEDBACK_PREFIX)
-    )
 
 
 def build_repair_feedback(call: dict[str, Any]) -> str:
@@ -77,33 +64,61 @@ def build_repair_feedback(call: dict[str, Any]) -> str:
     )
 
 
-def build_check_feedback(errors: list[dict]) -> str:
-    shown = errors[:15]
-    lines = "\n".join(
-        f"- [{v['check']}] {v['object_id']}: {v['message']}" for v in shown
-    )
-    more = f"\n（共 {len(errors)} 项，其余以后置报告为准）" if len(errors) > 15 else ""
-    return (
-        f"{CHECK_FEEDBACK_PREFIX}刚才提交的 ExtractionResult 语法合格，"
-        f"但内容校验发现 {len(errors)} 项错误：\n{lines}{more}\n"
-        "请修复这些问题后重新通过 ExtractionResult 提交完整结果。"
-        "修复对象而不是删除对象，删除有依据的对象视为信息丢失。"
-        "完整材料和设计参考已经提供，无须搜索文件。"
-    )
-
-
 class StructuredOutputRepairMiddleware(AgentMiddleware):
-    """invalid JSON 的静默终止与语义违规在这里都变成循环内的一轮修复。"""
+    """保留 invalid JSON 兜底，并记录每次实际模型调用耗时。"""
 
-    def __init__(
-        self,
-        max_rounds: int = 2,
-        material: str | None = None,
-        max_check_rounds: int = 2,
-    ) -> None:
+    def __init__(self, max_rounds: int = 2, model_calls: list[dict] | None = None) -> None:
         self.max_rounds = max_rounds
-        self.material = material
-        self.max_check_rounds = max_check_rounds
+        self.model_calls = model_calls if model_calls is not None else []
+
+    def wrap_model_call(self, request, handler):
+        started = perf_counter()
+        record = {}
+        try:
+            response = handler(request)
+            last = next((m for m in response.result if isinstance(m, AIMessage)), None)
+            if last:
+                record["usage"] = last.usage_metadata or {}
+                record["tool_calls"] = [call["name"] for call in last.tool_calls]
+            # 只去除明确的单层参数包装；不猜测业务值，也不修补截断 JSON。
+            if last and response.structured_response is None and len(last.tool_calls) == 1:
+                call = last.tool_calls[0]
+                args = call.get("args")
+                if call["name"] == STRUCTURED_TOOL_NAME and isinstance(args, dict) \
+                        and set(args) == {"arguments"}:
+                    try:
+                        unwrapped = args["arguments"]
+                        if isinstance(unwrapped, str):
+                            unwrapped = json.loads(unwrapped)
+                    except (ValueError, TypeError):
+                        pass
+                    else:
+                        if isinstance(unwrapped, dict) and set(unwrapped) == {
+                            "objects", "omissions", "conflicts", "unknowns"
+                        }:
+                            try:
+                                parsed = ExtractionResult.model_validate(unwrapped)
+                            except ValueError as error:
+                                parsed = None
+                                feedback = f"Error: 去除 arguments 包装后结构校验仍失败：{error}"
+                            else:
+                                feedback = "宿主已去除单层 arguments 包装并完成结构校验。"
+                            fixed_call = {**call, "args": unwrapped}
+                            fixed = last.model_copy(update={"tool_calls": [fixed_call]})
+                            response = ModelResponse(
+                                result=[fixed, ToolMessage(
+                                    content=feedback,
+                                    tool_call_id=call["id"], name=STRUCTURED_TOOL_NAME,
+                                )], structured_response=parsed,
+                            )
+                            record["normalization"] = "unwrapped_arguments"
+            return response
+        except Exception as error:
+            record["error"] = str(error)
+            raise
+        finally:
+            record["elapsed_seconds"] = round(perf_counter() - started, 3)
+            self.model_calls.append(record)
 
     @hook_config(can_jump_to=["model"])
     def after_model(self, state, runtime):
@@ -136,29 +151,4 @@ class StructuredOutputRepairMiddleware(AgentMiddleware):
             print(f"[循环内修复] 第 {count_structured_failures(messages)} 次解析失败，已注入修复反馈", flush=True)
             return {"messages": feedback, "jump_to": "model"}
 
-        return self._check_submission(state, last, messages)
-
-    def _check_submission(self, state, last: AIMessage, messages: list):
-        """合法提交后的语义校验：error 级违规打回重交，warning 放行。"""
-        if self.material is None or state.get("structured_response") is None:
-            return None
-        if not any(tc["name"] == STRUCTURED_TOOL_NAME for tc in last.tool_calls):
-            return None
-        if count_check_feedbacks(messages) >= self.max_check_rounds:
-            return None
-        response = state["structured_response"]
-        payload = (response.model_dump(by_alias=True) if hasattr(response, "model_dump") else response)
-        errors = [
-            v for v in run_checks(payload, self.material) if v["severity"] == "error"
-        ]
-        if not errors:
-            return None
-        print(
-            f"[循环内校验] 提交未过内容校验（{len(errors)} 个错误），打回重交",
-            flush=True,
-        )
-        return {
-            "messages": [HumanMessage(content=build_check_feedback(errors))],
-            "structured_response": None,
-            "jump_to": "model",
-        }
+        return None

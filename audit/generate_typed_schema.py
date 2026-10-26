@@ -31,9 +31,9 @@ for m in re.finditer(r"^### (.+)$", doc, re.M):
         if re.search(rf"\b{t}\b", heading) and t not in doc_fields:
             doc_fields[t] = sorted(set(data.keys()) - {"id"})
 
-BIZ = 'Literal["text", "number", "integer", "amount", "date", "choice", "reference", "boolean", "person", "datetime"]'
-CONTROL = 'Literal["text", "number", "amount", "date", "choice", "reference", "switch", "person"]'
-VIS = 'Literal["always", "conditional"]'
+BIZ = 'BusinessType'
+CONTROL = 'ControlType'
+VIS = 'VisibilityType'
 
 ATTACHED = {
     "note": "list[NoteItem] | None",
@@ -44,11 +44,12 @@ ATTACHED = {
 }
 
 OVERRIDES = {
+    "OptionSource": {"kind": 'Literal["fixed", "reference"]'},
     "Attribute": {"bizType": f"{BIZ} | None", "capacity": "dict[str, Any] | None",
                   "suggestedControl": f"{CONTROL} | None"},
     "FieldView": {"control": f"{CONTROL} | None", "visibility": f"{VIS} | None",
                   "displayStyle": "dict[str, Any] | None",
-                  "defaultValue": "str | int | float | None"},
+                  "defaultValue": "str | int | float | bool | None"},
     "Option": {"value": "str | int | float | None", "semanticColor": "str | None"},
     "Block": {"chart": "dict[str, Any] | None", "content": "Any", "geometry": "Any",
               "openLogic": "list[Any] | None", "saveLogic": "list[Any] | None",
@@ -78,7 +79,7 @@ OVERRIDES = {
                     "outputs": "list[str] | None"},
     "Requirement": {"coveredBy": "list[str] | None"},
     "DataSet": {"columns": "list[str] | None", "dimensions": "list[str] | None",
-                "summaries": "list[str] | None", "joins": "list[Any] | None"},
+                "summaries": "list[SummaryItem] | None", "joins": "list[Any] | None"},
     "Artifact": {"status": "str | None"},
     "ExternalService": {"inputs": "list[str] | None", "outputs": "list[str] | None"},
 }
@@ -113,7 +114,8 @@ L.append('"""')
 L.append('')
 L.append('from typing import Annotated, Any, Literal, Union')
 L.append('')
-L.append('from pydantic import BaseModel, ConfigDict, Field, model_validator')
+L.append('from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator')
+L.append('from research_agent.schemas.vocabulary import BusinessType, ControlType, RealizationType, VisibilityType')
 L.append('')
 L.append('')
 L.append('class NoteItem(BaseModel):')
@@ -136,6 +138,16 @@ L.append('    model_config = ConfigDict(extra="forbid")')
 L.append('    dataObject: str')
 L.append('    attribute: str | None = None')
 L.append('')
+L.append('class SummaryItem(BaseModel):')
+L.append('    """DataSet 内嵌汇总项，字段来自设计模型.md 的 DataSet 示例。"""')
+L.append('    model_config = ConfigDict(extra="forbid")')
+L.append('    key: str')
+for f in ('label', 'valueAttribute', 'aggregation', 'caliber'):
+    L.append(f'    {f}: str | None = None')
+L.append('    calculation: Any = None')
+for f, ann in ATTACHED.items():
+    L.append(f'    {f}: {ann} = None')
+L.append('')
 
 union_members = []
 for t in TYPES:
@@ -157,7 +169,10 @@ for t in TYPES:
         if f == "from":
             L.append('    from_: Annotated[RelationEnd, Field(alias="from")]')
             continue
-        ann = ov.get(f) or ATTACHED.get(f) or ("str | list[str] | None" if f == "label" else "Any")
+        ann = ov.get(f) or ATTACHED.get(f) or (
+            "RealizationType | None" if f == "realization" else
+            "str | list[str] | None" if f == "label" else "Any"
+        )
         if f in req:
             L.append(f"    {f}: {ann}")
         else:
@@ -180,10 +195,19 @@ L.append('        Field(discriminator="object_type"),')
 L.append('    ] = Field(description="设计文档中定义的对象字段，按类型强校验")')
 L.append('    evidence: list[str] = Field(min_length=1, description="支持这个对象的测试材料原文片段")')
 L.append('')
+L.append('    @field_validator("evidence")')
+L.append('    @classmethod')
+L.append('    def _nonblank_evidence(cls, value):')
+L.append('        if any(not item.strip() for item in value):')
+L.append('            raise ValueError("每条 evidence 必须是非空白原文片段")')
+L.append('        return value')
+L.append('')
 L.append('    @model_validator(mode="after")')
 L.append('    def _data_matches_object_type(self):')
 L.append('        # 无判别标签的联合可能被宽松成员吞掉最小载荷，这里强制对号入座。')
 L.append('        expected = _DATA_BY_TYPE[self.object_type]')
+L.append('        if not self.data.id.strip():')
+L.append('            raise ValueError("设计对象技术 id 不能为空白")')
 L.append('        if type(self.data) is not expected:')
 L.append('            raise ValueError(')
 L.append('                f"data 应为 {expected.__name__}，实际 {type(self.data).__name__}"')

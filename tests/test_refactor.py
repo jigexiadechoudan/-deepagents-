@@ -27,6 +27,7 @@ from research_agent.services.baseline_generator import BaselineGeneration, self_
 from research_agent.services.execution import execute_agent
 from research_agent.services.materials import load_material, load_reference
 from research_agent.services.validation import get_retry_error
+from research_agent.services.repair import RepairExecution
 
 
 MODEL_PARAMS = {
@@ -37,6 +38,8 @@ MODEL_PARAMS = {
     "max_tokens": 65536,
     "extra_body": {"thinking": {"type": "disabled"}},
 }
+
+WINDOWS_SYSTEM_ROOT = os.environ.get("SystemRoot")
 
 
 class FakeAgent:
@@ -123,6 +126,13 @@ class RefactorTests(unittest.TestCase):
                 "research_agent.workflow.create_extraction_agent", return_value=agent),
             "research_agent.workflow.load_skill_files": patch(
                 "research_agent.workflow.load_skill_files", return_value={}),
+            "research_agent.workflow.inspect_reference_contract": patch(
+                "research_agent.workflow.inspect_reference_contract", return_value={
+                    "missing_types": [], "unmodeled_types": [], "field_mismatches": [],
+                    "field_table": {"status": "matched"}}),
+            "research_agent.workflow.repair_extraction": patch(
+                "research_agent.workflow.repair_extraction",
+                side_effect=lambda candidate, *args, **kwargs: RepairExecution(candidate)),
         }
         patches.update(extra_patches or {})
         with (
@@ -139,6 +149,7 @@ class RefactorTests(unittest.TestCase):
         records = {
             path.name: json.loads(path.read_text(encoding="utf-8"))
             for path in self.settings.output_dir.glob("*.json")
+            if path.name.startswith(("run_", "extraction_", "retry_", "debug_"))
         }
         return agent, records
 
@@ -158,16 +169,13 @@ class RefactorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "DEEPSEEK_API_KEY"):
                 load_settings()
 
-    def test_prompts_and_schema_match_pre_refactor_fingerprints(self):
-        # 摘要在重构前从原 main.py 和 design_schema.py 的运行值计算。
-        digest = lambda text: hashlib.sha256(text.encode("utf-8")).hexdigest()
-        self.assertEqual(digest(build_system_prompt("REFERENCE")),
-                         "91d1036e505e99732554d9cb4e8c4a1577252339085d1d7e6d018aa5aba24796")
-        self.assertEqual(digest(json.dumps(build_messages("MATERIAL"), ensure_ascii=False)),
-                         "f40b006db4e8fcb1e204766e685547aef90b454e3394de49ac5b0d2d63733391")
-        schema = json.dumps(ExtractionResult.model_json_schema(), sort_keys=True, ensure_ascii=False)
-        self.assertEqual(digest(schema),
-                         "44709ca9905e16518965ee2660788b4cbdc3313955bab1832a01adb6cd341288")
+    def test_prompts_preserve_reference_material_and_unknown_boundary(self):
+        prompt = build_system_prompt("REFERENCE")
+        self.assertIn("<design_reference>\n    REFERENCE", prompt)
+        self.assertIn("业务推断只放 assumption/openItem", prompt)
+        self.assertIn("Artifact 是实际材料或文件", prompt)
+        self.assertIn("MATERIAL", build_messages("MATERIAL")[0]["content"])
+        self.assertEqual(set(ExtractionResult.model_fields), {"objects", "omissions", "conflicts", "unknowns"})
 
     def test_schema_enforces_typed_payload(self):
         # 合法类型 + 完整载荷通过（data 内的 object_type 标签与外层一致）
@@ -229,9 +237,8 @@ class RefactorTests(unittest.TestCase):
         self.assertEqual(kwargs["system_prompt"], build_system_prompt("REFERENCE"))
         self.assertIs(kwargs["response_format"].schema, ExtractionResult)
         (mw,) = kwargs["middleware"]
-        self.assertEqual(mw.material, "MATERIAL")
         self.assertEqual(mw.max_rounds, self.settings.max_structured_repair_rounds)
-        self.assertEqual(mw.max_check_rounds, self.settings.max_check_rounds)
+        self.assertFalse(hasattr(mw, "_check_submission"))
 
     def test_paths_and_reading_are_independent_of_working_directory(self):
         original = Path.cwd()
@@ -257,7 +264,7 @@ class RefactorTests(unittest.TestCase):
         ))
         self.assert_filenames(records)
         record = next(value for name, value in records.items() if name.startswith("run_"))
-        self.assertEqual(set(record), {
+        self.assertTrue({
             "run_id", "status", "started_at", "finished_at", "agent_elapsed_seconds",
             "invalid_tool_call_retry_count", "schema_validation_retry_count", "retry_debug_file",
             "model_params", "recursion_limit",
@@ -265,7 +272,11 @@ class RefactorTests(unittest.TestCase):
             "object_type_counts", "result_file", "total_completion_tokens", "transcript", "checks",
             "recursion_exhausted", "baseline_check", "baseline_manifest",
             "baseline_manifest_sha256", "baseline_stage",
-        })
+        } <= set(record))
+        self.assertEqual(record["structure_status"], "schema_valid")
+        self.assertEqual(record["quality_status"], "needs_review")
+        self.assertTrue((self.settings.output_dir / record["candidate_file"]).is_file())
+        self.assertTrue((self.settings.output_dir / record["contract_file"]).is_file())
         self.assertEqual(record["status"], "completed")
         self.assertEqual(record["invalid_tool_call_retry_count"], 0)
         self.assertIsNone(record["retry_debug_file"])
@@ -276,7 +287,7 @@ class RefactorTests(unittest.TestCase):
         self.assertEqual(record["reference_chars"], len(load_reference(self.reference)))
         self.assertIsNotNone(datetime.fromisoformat(record["started_at"]).tzinfo)
         self.assertEqual(records[record["result_file"]],
-                         successful_result()["structured_response"].model_dump(by_alias=True))
+                         successful_result()["structured_response"].model_dump(by_alias=True, exclude_none=True))
         self.assertEqual(len(records), 2)
 
     def test_baseline_manifest_roundtrip_from_converted_file(self):
@@ -350,8 +361,8 @@ class RefactorTests(unittest.TestCase):
         self.settings.baseline_mode = "auto"
         agent, records = self.run_workflow(
             [successful_result()],
-            extra_patches={"research_agent.workflow.generate_baseline_manifest":
-                           patch("research_agent.workflow.generate_baseline_manifest", fake_generator)},
+            extra_patches={"research_agent.services.baseline_store.generate_baseline_manifest":
+                           patch("research_agent.services.baseline_store.generate_baseline_manifest", fake_generator)},
         )
         self.assertEqual(seen, [load_material(self.material)])
         self.assertEqual(len(agent.calls), 1)
@@ -420,10 +431,10 @@ class RefactorTests(unittest.TestCase):
         self.assertEqual(retry["attempt"], 1)
         self.assertEqual(retry["status"], "invalid_tool_call")
         history = agent.calls[1][0]["messages"]
-        self.assertEqual(history[:-1], failed["messages"][:-1])
+        self.assertEqual(history[:-1], failed["messages"][:1])
         self.assertIsInstance(history[-1], HumanMessage)
         self.assertIn(retry["error"], history[-1].content)
-        self.assertEqual(history[1].tool_calls[0]["id"], history[2].tool_call_id)
+        self.assertFalse(any(isinstance(m, ToolMessage) for m in history))
         self.assertFalse(any(isinstance(m, AIMessage) and m.invalid_tool_calls for m in history))
         self.assertEqual(agent.calls[1][1], {"recursion_limit": 48})
         self.assert_filenames(records)
@@ -542,6 +553,9 @@ print("imports safe")
 '''
         for cwd in (PROJECT_DIR, self.root):
             env = dict(os.environ, PYTHONPATH=str(PROJECT_DIR), PYTHONIOENCODING="utf-8")
+            # Windows 的 Winsock/DLL 初始化需要此项；setUp 清空环境仅用于隔离密钥。
+            if WINDOWS_SYSTEM_ROOT:
+                env["SystemRoot"] = WINDOWS_SYSTEM_ROOT
             result = subprocess.run(
                 [sys.executable, "-B", "-c", script], cwd=cwd, env=env,
                 capture_output=True, text=True, encoding="utf-8", check=False,

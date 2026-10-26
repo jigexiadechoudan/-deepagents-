@@ -22,13 +22,11 @@ class Settings:
     recursion_limit: int = 48
     max_structured_repair_rounds: int = 2
     max_check_rounds: int = 2
-    # 场景基准：off=不核对；auto=每次由前置分析步从材料生成清单；file=读审核过的清单文件。
-    # auto 已端到端验证（值/标签粒度缺陷已修）；生成清单的全量人工核对通过后即为长期模式。
+    # auto=优先复用输入版本匹配的人工审核缓存，否则生成待审核清单。
+    # file=只读带审核信息和输入指纹的清单包；off=显式跳过覆盖基准。
     baseline_mode: str = "auto"
-    baseline_manifest_path: Path | None = (
-        PROJECT_DIR / "baselines" / "八达光电_客户料号映射_smardaten配置方案.json"
-    )
-    skill_dir: Path = Path("F:/调研skill/design-model-extraction")
+    baseline_manifest_path: Path | None = None
+    skill_dir: Path = PROJECT_DIR / "research_agent" / "skills" / "design-model-extraction"
 
 
 def load_settings() -> Settings:
